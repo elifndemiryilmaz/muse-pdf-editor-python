@@ -15,6 +15,8 @@ OUTPUT_DIR = os.path.join(BASE_DIR, 'outputs')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+PT_TO_MM = 25.4 / 72.0  # 1 pt = 1/72 inch
+
 def parse_style(style_str: str):
     style_dict = {}
     for part in style_str.split(";"):
@@ -154,7 +156,6 @@ def _group_by_avg_gap_and_style(lines):
 
 def _rgb_from_tuple(t):
     if t is None: return None
-    # PyMuPDF returns tuples of floats 0..1 or ints 0..255 depending on source; normalize to 0..255 int list
     vals = list(t)
     if not vals: return None
     if max(vals) <= 1.0: vals = [int(round(v*255)) for v in vals]
@@ -164,7 +165,6 @@ def _shapes_from_drawings(page):
     out = []
     drawings = page.get_drawings()
     for idx, d in enumerate(drawings):
-        # d keys may include: rect, color (stroke), fill, width/linewidth, dashes, lineCap, lineJoin, miterLimit, opacity, blendmode, paths/items
         rect = d.get("rect", None)
         stroke = _rgb_from_tuple(d.get("color"))
         fill = _rgb_from_tuple(d.get("fill"))
@@ -175,14 +175,11 @@ def _shapes_from_drawings(page):
         miter = d.get("miterLimit")
         opacity = d.get("opacity")
         blendmode = d.get("blendmode")
-        # bbox
         if rect is not None:
             bbox = [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
         else:
-            # fallback: union of points in items/paths
             xmins, ymins, xmaxs, ymaxs = [], [], [], []
             for it in d.get("items", []) or d.get("paths", []) or []:
-                # it may be list of points [(x,y), ...]
                 try:
                     for p in it:
                         xmins.append(float(p[0])); ymins.append(float(p[1]))
@@ -244,6 +241,32 @@ def _annots_from_page(page):
         i += 1
         a = a.next
     return out
+
+# ISO + common sizes in mm (shorter side, longer side)
+_KNOWN_SIZES_MM = OrderedDict([
+    ("A0", (841, 1189)),
+    ("A1", (594, 841)),
+    ("A2", (420, 594)),
+    ("A3", (297, 420)),
+    ("A4", (210, 297)),
+    ("A5", (148, 210)),
+    ("A6", (105, 148)),
+    ("Letter", (216, 279)),   # US Letter
+    ("Legal", (216, 356)),    # US Legal
+])
+
+def _classify_page_iso(width_pt: float, height_pt: float):
+    w_mm = float(width_pt) * PT_TO_MM
+    h_mm = float(height_pt) * PT_TO_MM
+    s_min, s_max = sorted([w_mm, h_mm])
+    best_name, best_score = None, 1e9
+    for name, (mm_min, mm_max) in _KNOWN_SIZES_MM.items():
+        score = abs(s_min - mm_min) + abs(s_max - mm_max)
+        if score < best_score:
+            best_name, best_score = name, score
+    if best_score <= 20.0:
+        return best_name
+    return "Unknown"
 
 def pdf_to_pages(pdf_path):
     doc = fitz.open(pdf_path)
@@ -310,11 +333,22 @@ def pdf_to_pages(pdf_path):
             a["id"] = f"a:{page_idx}:{next_id}"
             elements.append(a); next_id += 1
 
-        # page meta (size / rotation)
+        # page meta
+        width_pt = float(page.rect.width)
+        height_pt = float(page.rect.height)
+        orientation = "portrait" if height_pt >= width_pt else "landscape"
+        iso = _classify_page_iso(width_pt, height_pt)
+
         pages.append(OrderedDict([
             ("page", page_idx),
-            ("size", OrderedDict([("width", float(page.rect.width)), ("height", float(page.rect.height)), ("unit", "pt")])),
             ("rotation", int(page.rotation or 0)),
+            ("size", OrderedDict([
+                ("width", width_pt),
+                ("height", height_pt),
+                ("unit", "pt"),
+                ("iso", iso),
+                ("orientation", orientation)
+            ])),
             ("elements", elements),
         ]))
 
