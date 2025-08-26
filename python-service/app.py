@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
 from collections import OrderedDict, Counter
-import os, re, statistics, fitz
+import os, re, statistics, base64, fitz
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
@@ -17,6 +17,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 PT_TO_MM = 25.4 / 72.0  # 1 pt = 1/72 inch
 
+# ---------- Helpers ----------
 def parse_style(style_str: str):
     style_dict = {}
     for part in style_str.split(";"):
@@ -66,6 +67,30 @@ def _css_flags(style: dict):
     strike = ("line-through" in td) or ("strikethrough" in td)
     return bold, italic, underline, strike
 
+def _mean(values, default=0.0):
+    try: return statistics.mean(values) if values else default
+    except statistics.StatisticsError: return default
+
+def _dominant(items):
+    if not items: return None
+    return Counter(items).most_common(1)[0][0]
+
+def _style_equal(a, b, size_tol=0.5):
+    if (a.get("font","").lower() != b.get("font","").lower()): return False
+    if abs(float(a.get("fontSize",0)) - float(b.get("fontSize",0))) > size_tol: return False
+    if int(a.get("colors_dominant", a.get("color",0))) != int(b.get("colors_dominant", b.get("color",0))): return False
+    if bool(a.get("bold", False)) != bool(b.get("bold", False)): return False
+    if bool(a.get("italic", False)) != bool(b.get("italic", False)): return False
+    return True
+
+def _rgb_from_tuple(t):
+    if t is None: return None
+    vals = list(t)
+    if not vals: return None
+    if max(vals) <= 1.0: vals = [int(round(v*255)) for v in vals]
+    return [int(v) for v in vals[:3]]
+
+# ---------- HTML path (utility) ----------
 def html_to_pages_from_string(html_str: str):
     soup = BeautifulSoup(html_str, "lxml")
     elements, next_id = [], 0
@@ -92,6 +117,7 @@ def html_to_pages_from_string(html_str: str):
         next_id += 1
     return [OrderedDict([("page", 1), ("elements", elements)])]
 
+# ---------- Text extraction ----------
 def _build_lines_from_spans(page_dict):
     lines = []
     for block in page_dict.get("blocks", []):
@@ -118,22 +144,6 @@ def _build_lines_from_spans(page_dict):
     lines.sort(key=lambda l: (l["top"], l["left"]))
     return lines
 
-def _mean(values, default=0.0):
-    try: return statistics.mean(values) if values else default
-    except statistics.StatisticsError: return default
-
-def _dominant(items):
-    if not items: return None
-    return Counter(items).most_common(1)[0][0]
-
-def _style_equal(a, b, size_tol=0.5):
-    if (a.get("font","").lower() != b.get("font","").lower()): return False
-    if abs(float(a.get("fontSize",0)) - float(b.get("fontSize",0))) > size_tol: return False
-    if int(a.get("colors_dominant", a.get("color",0))) != int(b.get("colors_dominant", b.get("color",0))): return False
-    if bool(a.get("bold", False)) != bool(b.get("bold", False)): return False
-    if bool(a.get("italic", False)) != bool(b.get("italic", False)): return False
-    return True
-
 def _group_by_avg_gap_and_style(lines):
     if not lines: return ([], 0.0)
     for l in lines:
@@ -154,13 +164,7 @@ def _group_by_avg_gap_and_style(lines):
     if cur: groups.append(cur)
     return groups, avg_gap
 
-def _rgb_from_tuple(t):
-    if t is None: return None
-    vals = list(t)
-    if not vals: return None
-    if max(vals) <= 1.0: vals = [int(round(v*255)) for v in vals]
-    return [int(v) for v in vals[:3]]
-
+# ---------- Shapes (vector) ----------
 def _shapes_from_drawings(page):
     out = []
     drawings = page.get_drawings()
@@ -192,7 +196,7 @@ def _shapes_from_drawings(page):
                 bbox = None
         if not bbox: continue
         out.append(OrderedDict([
-            ("id", f"v:{page.number+1}:{idx}"),
+            ("id", None),  # set later
             ("type", "shape"),
             ("page", page.number+1),
             ("bbox", bbox),
@@ -204,10 +208,12 @@ def _shapes_from_drawings(page):
             ("strokeJoin", lineJoin),
             ("miterLimit", miter),
             ("opacity", opacity),
-            ("blendMode", blendmode)
+            ("blendMode", blendmode),
+            ("zIndex", idx)
         ]))
     return out
 
+# ---------- Annotations ----------
 def _annots_from_page(page):
     out, i = [], 0
     try:
@@ -219,17 +225,16 @@ def _annots_from_page(page):
         try: typ = a.type[1]
         except Exception: pass
         r = a.rect
-        info = {}
+        info, colors = {}, {}
         try: info = a.info or {}
         except Exception: pass
-        colors = {}
         try: colors = a.colors or {}
         except Exception: pass
         subtype = info.get("name") or typ
         contents = info.get("content")
         title = info.get("title")
         out.append(OrderedDict([
-            ("id", f"a:{page.number+1}:{i}"),
+            ("id", None),  # set later
             ("type", "annotation"),
             ("page", page.number+1),
             ("subtype", subtype),
@@ -242,7 +247,7 @@ def _annots_from_page(page):
         a = a.next
     return out
 
-# ISO + common sizes in mm (shorter side, longer side)
+# ---------- ISO sizes ----------
 _KNOWN_SIZES_MM = OrderedDict([
     ("A0", (841, 1189)),
     ("A1", (594, 841)),
@@ -251,8 +256,8 @@ _KNOWN_SIZES_MM = OrderedDict([
     ("A4", (210, 297)),
     ("A5", (148, 210)),
     ("A6", (105, 148)),
-    ("Letter", (216, 279)),   # US Letter
-    ("Legal", (216, 356)),    # US Legal
+    ("Letter", (216, 279)),
+    ("Legal", (216, 356)),
 ])
 
 def _classify_page_iso(width_pt: float, height_pt: float):
@@ -268,7 +273,17 @@ def _classify_page_iso(width_pt: float, height_pt: float):
         return best_name
     return "Unknown"
 
-def pdf_to_pages(pdf_path):
+# ---------- Background raster ----------
+def _page_background_data_uri(page, dpi: int = 150):
+    scale = dpi / 72.0
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    data = pix.tobytes("png")
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+# ---------- Main extraction ----------
+def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
     doc = fitz.open(pdf_path)
     pages = []
     for page_idx, page in enumerate(doc, start=1):
@@ -327,7 +342,7 @@ def pdf_to_pages(pdf_path):
             s["id"] = f"v:{page_idx}:{next_id}"
             elements.append(s); next_id += 1
 
-        # annotations (includes widgets)
+        # annotations
         annots = _annots_from_page(page)
         for a in annots:
             a["id"] = f"a:{page_idx}:{next_id}"
@@ -339,6 +354,30 @@ def pdf_to_pages(pdf_path):
         orientation = "portrait" if height_pt >= width_pt else "landscape"
         iso = _classify_page_iso(width_pt, height_pt)
 
+        # background raster (data URI)
+        background = None
+        if bg_enable:
+            try:
+                background = OrderedDict([
+                    ("type", "image"),
+                    ("dpi", int(bg_dpi)),
+                    ("src", _page_background_data_uri(page, dpi=int(bg_dpi)))
+                ])
+            except Exception:
+                background = None
+
+        # heuristic background element ids (large + early)
+        bg_ids = []
+        page_area = width_pt * height_pt if (width_pt and height_pt) else 1.0
+        for el in elements:
+            if el["type"] in ("image", "shape"):
+                x1,y1,x2,y2 = el["bbox"]
+                area = max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
+                area_ratio = area / page_area if page_area else 0.0
+                z = el.get("zIndex", 0)
+                if area_ratio >= 0.7 and z <= 2:  # tune thresholds as needed
+                    bg_ids.append(el["id"])
+
         pages.append(OrderedDict([
             ("page", page_idx),
             ("rotation", int(page.rotation or 0)),
@@ -349,12 +388,15 @@ def pdf_to_pages(pdf_path):
                 ("iso", iso),
                 ("orientation", orientation)
             ])),
+            ("background", background),
+            ("backgroundElementIds", bg_ids),
             ("elements", elements),
         ]))
 
     doc.close()
     return pages
 
+# ---------- Routes ----------
 @app.get('/health')
 def health():
     return jsonify({"status": "ok", "service": "python"})
@@ -366,10 +408,15 @@ def convert_pdf_to_html():
     f = request.files['file']
     filename = secure_filename(f.filename or 'upload.pdf')
     upload_id = request.form.get('uploadId') or 'unknown'
+    # background toggles
+    bg_flag = request.form.get('bg', request.args.get('bg', '1'))
+    bg_dpi = int(request.form.get('bgDpi', request.args.get('bgDpi', '150')))
+    bg_enable = str(bg_flag).lower() not in ('0','false','no')
+
     file_path = os.path.join(UPLOAD_DIR, filename)
     f.save(file_path)
     try:
-        pages = pdf_to_pages(file_path)
+        pages = pdf_to_pages(file_path, bg_enable=bg_enable, bg_dpi=bg_dpi)
         return jsonify(OrderedDict([
             ("filename", filename),
             ("uploadId", upload_id),
