@@ -4,16 +4,10 @@ from flask_cors import CORS
 from collections import OrderedDict, Counter
 import os, re, statistics, fitz
 from bs4 import BeautifulSoup
-import html as html_escape
 
 app = Flask(__name__)
-CORS(
-    app,
-    resources={r"/*": {"origins": "*"}},
-    methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "ngrok-skip-browser-warning"],
-    expose_headers=["Content-Type"]
-)
+CORS(app, resources={r"/*": {"origins": "*"}}, methods=["GET", "POST", "OPTIONS"],
+     allow_headers=["Content-Type", "ngrok-skip-browser-warning"], expose_headers=["Content-Type"])
 
 BASE_DIR = os.path.dirname(__file__)
 UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
@@ -25,8 +19,8 @@ def parse_style(style_str: str):
     style_dict = {}
     for part in style_str.split(";"):
         if ":" in part:
-            key, value = part.split(":", 1)
-            style_dict[key.strip().lower()] = value.strip()
+            k, v = part.split(":", 1)
+            style_dict[k.strip().lower()] = v.strip()
     return style_dict
 
 def _int_color_to_rgb(color_int: int):
@@ -36,8 +30,7 @@ def _int_color_to_rgb(color_int: int):
     return [int(r), int(g), int(b)]
 
 def _css_color_to_rgb(css: str):
-    if not css:
-        return None
+    if not css: return None
     css = css.strip()
     m = re.match(r"rgb\s*\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)", css, re.I)
     if m:
@@ -45,23 +38,19 @@ def _css_color_to_rgb(css: str):
         return [max(0, min(r, 255)), max(0, min(g, 255)), max(0, min(b, 255))]
     m = re.match(r"#([0-9a-f]{6})$", css, re.I)
     if m:
-        hx = m.group(1)
-        return [int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)]
+        hx = m.group(1); return [int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)]
     m = re.match(r"#([0-9a-f]{3})$", css, re.I)
     if m:
-        h = m.group(1)
-        return [int(h[0]*2, 16), int(h[1]*2, 16), int(h[2]*2, 16)]
+        h = m.group(1); return [int(h[0]*2, 16), int(h[1]*2, 16), int(h[2]*2, 16)]
     return None
 
 def _infer_bold_from_font(font_name: str) -> bool:
-    if not font_name:
-        return False
+    if not font_name: return False
     f = font_name.lower()
     return any(k in f for k in ["bold", "black", "heavy", "demi", "semibold"])
 
 def _infer_italic_from_font(font_name: str) -> bool:
-    if not font_name:
-        return False
+    if not font_name: return False
     f = font_name.lower()
     return ("italic" in f) or ("oblique" in f)
 
@@ -77,219 +66,256 @@ def _css_flags(style: dict):
 
 def html_to_pages_from_string(html_str: str):
     soup = BeautifulSoup(html_str, "lxml")
-    elements = []
-    next_id = 0
-
+    elements, next_id = [], 0
     for span in soup.find_all("span"):
         style = parse_style(span.get("style", ""))
-        def px_to_float(v, default=0.0):
-            try:
-                return float(re.sub("px", "", v))
-            except Exception:
-                return default
-        x = px_to_float(style.get("left", "0"))
-        y = px_to_float(style.get("top", "0"))
-        w = px_to_float(style.get("width", "0"))
-        h = px_to_float(style.get("height", "0"))
-        size = px_to_float(style.get("font-size", "12"), 12.0)
+        def px(v, d=0.0):
+            try: return float(re.sub("px", "", v))
+            except Exception: return d
+        x, y = px(style.get("left", "0")), px(style.get("top", "0"))
+        w, h = px(style.get("width", "0")), px(style.get("height", "0"))
+        size = px(style.get("font-size", "12"), 12.0)
         font = (style.get("font-family", "") or "").replace('"', "")
         color_rgb = _css_color_to_rgb(style.get("color"))
-        bold_css, italic_css, underline_css, strike_css = _css_flags(style)
-
+        b,i,u,s = _css_flags(style)
         content = (span.get_text() or "").strip()
-        if not content:
-            continue
-
+        if not content: continue
         bbox = [x, y, x + w, y + h] if (w and h) else [x, y, x, y]
         elements.append(OrderedDict([
-            ("id", f"t:1:{next_id}"),
-            ("type", "text"),
-            ("content", content),
-            ("font", font),
-            ("fontSize", float(size)),
-            ("bbox", [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]),
-            ("color", color_rgb),
-            ("bold", bool(bold_css)),
-            ("italic", bool(italic_css)),
-            ("underline", bool(underline_css)),
-            ("strike", bool(strike_css)),
+            ("id", f"t:1:{next_id}"), ("type", "text"), ("content", content),
+            ("font", font), ("fontSize", float(size)), ("bbox", [float(b) for b in bbox]),
+            ("color", color_rgb), ("bold", bool(b)), ("italic", bool(i)),
+            ("underline", bool(u)), ("strike", bool(s))
         ]))
         next_id += 1
-
     return [OrderedDict([("page", 1), ("elements", elements)])]
 
 def _build_lines_from_spans(page_dict):
     lines = []
     for block in page_dict.get("blocks", []):
-        if "lines" not in block:
-            continue
+        if "lines" not in block: continue
         for line in block["lines"]:
             spans = line.get("spans", [])
-            if not spans:
-                continue
-            text_parts = []
-            x0s, y0s, x1s, y1s = [], [], [], []
-            fonts, sizes, colors = [], [], []
+            if not spans: continue
+            text_parts, x0s, y0s, x1s, y1s, fonts, sizes, colors = [], [], [], [], [], [], [], []
             for sp in spans:
-                t = sp.get("text", "")
-                if t:
-                    text_parts.append(t)
-                bx = sp.get("bbox", [0, 0, 0, 0])
+                t = sp.get("text", "") or ""
+                bx = sp.get("bbox", [0,0,0,0])
+                if t: text_parts.append(t)
                 x0s.append(bx[0]); y0s.append(bx[1]); x1s.append(bx[2]); y1s.append(bx[3])
-                fonts.append(sp.get("font", ""))
-                sizes.append(float(sp.get("size", 0)))
-                colors.append(int(sp.get("color", 0)))
+                fonts.append(sp.get("font", "") or ""); sizes.append(float(sp.get("size", 0))); colors.append(int(sp.get("color", 0)))
             line_text = "".join(text_parts).strip()
-            if not line_text:
-                continue
-            line_obj = {
+            if not line_text: continue
+            lines.append({
                 "text": line_text,
                 "left": float(min(x0s)), "top": float(min(y0s)),
                 "right": float(max(x1s)), "bottom": float(max(y1s)),
                 "height": float(max(y1s) - min(y0s)),
                 "fonts": fonts, "sizes": sizes, "colors": colors
-            }
-            lines.append(line_obj)
+            })
     lines.sort(key=lambda l: (l["top"], l["left"]))
     return lines
 
 def _mean(values, default=0.0):
-    try:
-        return statistics.mean(values) if values else default
-    except statistics.StatisticsError:
-        return default
+    try: return statistics.mean(values) if values else default
+    except statistics.StatisticsError: return default
 
 def _dominant(items):
-    if not items:
-        return None
+    if not items: return None
     return Counter(items).most_common(1)[0][0]
 
 def _style_equal(a, b, size_tol=0.5):
     if (a.get("font","").lower() != b.get("font","").lower()): return False
     if abs(float(a.get("fontSize",0)) - float(b.get("fontSize",0))) > size_tol: return False
     if int(a.get("colors_dominant", a.get("color",0))) != int(b.get("colors_dominant", b.get("color",0))): return False
-    # optional flags if present on lines
     if bool(a.get("bold", False)) != bool(b.get("bold", False)): return False
     if bool(a.get("italic", False)) != bool(b.get("italic", False)): return False
     return True
 
 def _group_by_avg_gap_and_style(lines):
-    if not lines:
-        return [], 0.0
-    # set line-level dominant style for grouping
+    if not lines: return ([], 0.0)
     for l in lines:
         l["font"] = _dominant(l["fonts"]) or ""
-        sizes_pos = [s for s in l["sizes"] if s > 0]
-        l["fontSize"] = float(statistics.median(sizes_pos)) if sizes_pos else 12.0
+        pos = [s for s in l["sizes"] if s > 0]
+        l["fontSize"] = float(statistics.median(pos)) if pos else 12.0
         l["colors_dominant"] = _dominant(l["colors"]) if l["colors"] else 0
         l["bold"] = _infer_bold_from_font(l["font"])
         l["italic"] = _infer_italic_from_font(l["font"])
-
-    gaps = []
-    for i in range(1, len(lines)):
-        gaps.append(max(0.0, lines[i]["top"] - lines[i-1]["bottom"]))
+    gaps = [max(0.0, lines[i]["top"] - lines[i-1]["bottom"]) for i in range(1, len(lines))]
     avg_gap = _mean(gaps, default=(statistics.median([l["height"] for l in lines]) if lines else 12.0))
-
-    groups = []
-    current = [lines[0]] if lines else []
+    groups, cur = [], [lines[0]]
     for i in range(1, len(lines)):
-        prev, cur = lines[i-1], lines[i]
-        gap = max(0.0, cur["top"] - prev["bottom"])
-        if gap <= avg_gap and _style_equal(prev, cur):
-            current.append(cur)
-        else:
-            groups.append(current)
-            current = [cur]
-    if current:
-        groups.append(current)
+        prev, curline = lines[i-1], lines[i]
+        gap = max(0.0, curline["top"] - prev["bottom"])
+        if gap <= avg_gap and _style_equal(prev, curline): cur.append(curline)
+        else: groups.append(cur); cur = [curline]
+    if cur: groups.append(cur)
     return groups, avg_gap
+
+def _rgb_from_tuple(t):
+    if t is None: return None
+    # PyMuPDF returns tuples of floats 0..1 or ints 0..255 depending on source; normalize to 0..255 int list
+    vals = list(t)
+    if not vals: return None
+    if max(vals) <= 1.0: vals = [int(round(v*255)) for v in vals]
+    return [int(v) for v in vals[:3]]
+
+def _shapes_from_drawings(page):
+    out = []
+    drawings = page.get_drawings()
+    for idx, d in enumerate(drawings):
+        # d keys may include: rect, color (stroke), fill, width/linewidth, dashes, lineCap, lineJoin, miterLimit, opacity, blendmode, paths/items
+        rect = d.get("rect", None)
+        stroke = _rgb_from_tuple(d.get("color"))
+        fill = _rgb_from_tuple(d.get("fill"))
+        lw = float(d.get("width") or d.get("linewidth") or 1.0)
+        dashes = d.get("dashes")
+        lineCap = d.get("lineCap")
+        lineJoin = d.get("lineJoin")
+        miter = d.get("miterLimit")
+        opacity = d.get("opacity")
+        blendmode = d.get("blendmode")
+        # bbox
+        if rect is not None:
+            bbox = [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
+        else:
+            # fallback: union of points in items/paths
+            xmins, ymins, xmaxs, ymaxs = [], [], [], []
+            for it in d.get("items", []) or d.get("paths", []) or []:
+                # it may be list of points [(x,y), ...]
+                try:
+                    for p in it:
+                        xmins.append(float(p[0])); ymins.append(float(p[1]))
+                        xmaxs.append(float(p[0])); ymaxs.append(float(p[1]))
+                except Exception:
+                    pass
+            if xmins:
+                bbox = [min(xmins), min(ymins), max(xmaxs), max(ymaxs)]
+            else:
+                bbox = None
+        if not bbox: continue
+        out.append(OrderedDict([
+            ("id", f"v:{page.number+1}:{idx}"),
+            ("type", "shape"),
+            ("page", page.number+1),
+            ("bbox", bbox),
+            ("strokeColor", stroke),
+            ("fillColor", fill),
+            ("lineWidth", lw),
+            ("strokeDash", dashes),
+            ("strokeCap", lineCap),
+            ("strokeJoin", lineJoin),
+            ("miterLimit", miter),
+            ("opacity", opacity),
+            ("blendMode", blendmode)
+        ]))
+    return out
+
+def _annots_from_page(page):
+    out, i = [], 0
+    try:
+        a = page.first_annot
+    except Exception:
+        a = None
+    while a:
+        typ = None
+        try: typ = a.type[1]
+        except Exception: pass
+        r = a.rect
+        info = {}
+        try: info = a.info or {}
+        except Exception: pass
+        colors = {}
+        try: colors = a.colors or {}
+        except Exception: pass
+        subtype = info.get("name") or typ
+        contents = info.get("content")
+        title = info.get("title")
+        out.append(OrderedDict([
+            ("id", f"a:{page.number+1}:{i}"),
+            ("type", "annotation"),
+            ("page", page.number+1),
+            ("subtype", subtype),
+            ("bbox", [float(r.x0), float(r.y0), float(r.x1), float(r.y1)]),
+            ("title", title),
+            ("contents", contents),
+            ("colors", colors)
+        ]))
+        i += 1
+        a = a.next
+    return out
 
 def pdf_to_pages(pdf_path):
     doc = fitz.open(pdf_path)
     pages = []
-
-    for page_num, page in enumerate(doc, start=1):
+    for page_idx, page in enumerate(doc, start=1):
         page_dict = page.get_text("dict")
 
-        # text: lines -> groups
+        # text paragraphs
         lines = _build_lines_from_spans(page_dict)
         groups, avg_gap = _group_by_avg_gap_and_style(lines)
 
-        page_elements = []
-        next_id = 0
-
-        # paragraph elements
+        elements, next_id = [], 0
         for glines in groups:
-            if not glines:
-                continue
-            left = min(l["left"] for l in glines)
-            top = min(l["top"] for l in glines)
-            right = max(l["right"] for l in glines)
-            bottom = max(l["bottom"] for l in glines)
-
+            left = min(l["left"] for l in glines); top = min(l["top"] for l in glines)
+            right = max(l["right"] for l in glines); bottom = max(l["bottom"] for l in glines)
             content = "\n".join(l["text"] for l in glines)
-
             s0 = glines[0]
             dom_font = s0["font"] or ""
             dom_size = float(s0["fontSize"])
             color_rgb = _int_color_to_rgb(int(s0["colors_dominant"])) if s0.get("colors_dominant") is not None else None
-            bold = bool(s0.get("bold", False))
-            italic = bool(s0.get("italic", False))
-
-            line_items = []
-            for l in glines:
-                line_items.append(OrderedDict([
-                    ("text", l["text"]),
-                    ("bbox", [float(l["left"]), float(l["top"]), float(l["right"]), float(l["bottom"])])
-                ]))
-
-            page_elements.append(OrderedDict([
-                ("id", f"t:{page_num}:{next_id}"),
-                ("type", "text"),
-                ("content", content),
-                ("font", dom_font),
-                ("fontSize", dom_size),
+            bold = bool(s0.get("bold", False)); italic = bool(s0.get("italic", False))
+            line_items = [OrderedDict([
+                ("text", l["text"]),
+                ("bbox", [float(l["left"]), float(l["top"]), float(l["right"]), float(l["bottom"])])
+            ]) for l in glines]
+            elements.append(OrderedDict([
+                ("id", f"t:{page_idx}:{next_id}"), ("type", "text"), ("content", content),
+                ("font", dom_font), ("fontSize", dom_size),
                 ("bbox", [float(left), float(top), float(right), float(bottom)]),
-                ("color", color_rgb),
-                ("bold", bold),
-                ("italic", italic),
-                ("underline", False),
-                ("strike", False),
+                ("color", color_rgb), ("bold", bold), ("italic", italic),
+                ("underline", False), ("strike", False),
                 ("lines", line_items)
             ]))
             next_id += 1
 
-        # images: PyMuPDF xref + bbox (recommended core)
+        # bitmap images (xref + bbox)
         for z_idx, img in enumerate(page.get_images(full=True)):
-            # tuple: (xref, smask, width, height, bpc, colorspace, ...) varies by version
-            xref = int(img[0])
-            smask = img[1]
+            xref = int(img[0]); smask = img[1]
             width = int(img[2]) if len(img) > 2 else None
             height = int(img[3]) if len(img) > 3 else None
             bpc = int(img[4]) if len(img) > 4 else None
-            cs = img[5] if len(img) > 5 else None  # may be int or str depending on version
-
+            cs = img[5] if len(img) > 5 else None
             rect = page.get_image_bbox(img)
             bbox = [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
             has_alpha = (smask not in (0, -1, None))
-
-            page_elements.append(OrderedDict([
-                ("id", f"i:{page_num}:{next_id}"),
-                ("type", "image"),
-                ("page", page_num),
-                ("bbox", bbox),
-                ("xref", xref),
+            elements.append(OrderedDict([
+                ("id", f"i:{page_idx}:{next_id}"), ("type", "image"), ("page", page_idx),
+                ("bbox", bbox), ("xref", xref),
                 ("naturalSize", OrderedDict([("width", width), ("height", height)])),
-                ("bitsPerComponent", bpc),
-                ("colorSpace", cs),
-                ("hasAlpha", bool(has_alpha)),
-                ("zIndex", z_idx)
+                ("bitsPerComponent", bpc), ("colorSpace", cs),
+                ("hasAlpha", bool(has_alpha)), ("zIndex", z_idx)
             ]))
             next_id += 1
 
+        # vector shapes
+        shapes = _shapes_from_drawings(page)
+        for s in shapes:
+            s["id"] = f"v:{page_idx}:{next_id}"
+            elements.append(s); next_id += 1
+
+        # annotations (includes widgets)
+        annots = _annots_from_page(page)
+        for a in annots:
+            a["id"] = f"a:{page_idx}:{next_id}"
+            elements.append(a); next_id += 1
+
+        # page meta (size / rotation)
         pages.append(OrderedDict([
-            ("page", page_num),
-            ("elements", page_elements),
+            ("page", page_idx),
+            ("size", OrderedDict([("width", float(page.rect.width)), ("height", float(page.rect.height)), ("unit", "pt")])),
+            ("rotation", int(page.rotation or 0)),
+            ("elements", elements),
         ]))
 
     doc.close()
@@ -303,12 +329,11 @@ def health():
 def convert_pdf_to_html():
     if 'file' not in request.files:
         return jsonify({"error": "missing file field 'file'"}), 400
-    file = request.files['file']
-    filename = secure_filename(file.filename or 'upload.pdf')
+    f = request.files['file']
+    filename = secure_filename(f.filename or 'upload.pdf')
     upload_id = request.form.get('uploadId') or 'unknown'
     file_path = os.path.join(UPLOAD_DIR, filename)
-    file.save(file_path)
-
+    f.save(file_path)
     try:
         pages = pdf_to_pages(file_path)
         return jsonify(OrderedDict([
@@ -317,12 +342,10 @@ def convert_pdf_to_html():
             ("pages", pages),
         ]))
     except Exception as e:
-        return jsonify({"error": f"failed to convert: {e}"}), 500
+        return jsonify({"error": f"{e}"}), 500
     finally:
-        try:
-            os.unlink(file_path)
-        except Exception:
-            pass
+        try: os.unlink(file_path)
+        except Exception: pass
 
 @app.post('/generate/html-to-pdf')
 def generate_html_to_pdf():
