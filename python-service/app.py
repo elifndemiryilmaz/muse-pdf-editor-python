@@ -71,6 +71,10 @@ def _mean(values, default=0.0):
     try: return statistics.mean(values) if values else default
     except statistics.StatisticsError: return default
 
+def _median(values, default=0.0):
+    try: return statistics.median(values) if values else default
+    except statistics.StatisticsError: return default
+
 def _dominant(items):
     if not items: return None
     return Counter(items).most_common(1)[0][0]
@@ -108,9 +112,12 @@ def html_to_pages_from_string(html_str: str):
         content = (span.get_text() or "").strip()
         if not content: continue
         bbox = [x, y, x + w, y + h] if (w and h) else [x, y, x, y]
+        # approximate line height from CSS height if present, else from font size
+        line_height = float(h) if h > 0 else float(size) * 1.2
         elements.append(OrderedDict([
             ("id", f"t:1:{next_id}"), ("type", "text"), ("content", content),
-            ("font", font), ("fontSize", float(size)), ("bbox", [float(b) for b in bbox]),
+            ("font", font), ("fontSize", float(size)), ("lineHeight", float(line_height)),
+            ("bbox", [float(b) for b in bbox]),
             ("color", color_rgb), ("bold", bool(b)), ("italic", bool(i)),
             ("underline", bool(u)), ("strike", bool(s))
         ]))
@@ -149,12 +156,12 @@ def _group_by_avg_gap_and_style(lines):
     for l in lines:
         l["font"] = _dominant(l["fonts"]) or ""
         pos = [s for s in l["sizes"] if s > 0]
-        l["fontSize"] = float(statistics.median(pos)) if pos else 12.0
+        l["fontSize"] = float(_median(pos, 12.0))
         l["colors_dominant"] = _dominant(l["colors"]) if l["colors"] else 0
         l["bold"] = _infer_bold_from_font(l["font"])
         l["italic"] = _infer_italic_from_font(l["font"])
     gaps = [max(0.0, lines[i]["top"] - lines[i-1]["bottom"]) for i in range(1, len(lines))]
-    avg_gap = _mean(gaps, default=(statistics.median([l["height"] for l in lines]) if lines else 12.0))
+    avg_gap = _mean(gaps, default=_median([l["height"] for l in lines], 12.0))
     groups, cur = [], [lines[0]]
     for i in range(1, len(lines)):
         prev, curline = lines[i-1], lines[i]
@@ -196,7 +203,7 @@ def _shapes_from_drawings(page):
                 bbox = None
         if not bbox: continue
         out.append(OrderedDict([
-            ("id", None),  # set later
+            ("id", None),
             ("type", "shape"),
             ("page", page.number+1),
             ("bbox", bbox),
@@ -234,7 +241,7 @@ def _annots_from_page(page):
         contents = info.get("content")
         title = info.get("title")
         out.append(OrderedDict([
-            ("id", None),  # set later
+            ("id", None),
             ("type", "annotation"),
             ("page", page.number+1),
             ("subtype", subtype),
@@ -289,7 +296,6 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
     for page_idx, page in enumerate(doc, start=1):
         page_dict = page.get_text("dict")
 
-        # text paragraphs
         lines = _build_lines_from_spans(page_dict)
         groups, avg_gap = _group_by_avg_gap_and_style(lines)
 
@@ -303,21 +309,24 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
             dom_size = float(s0["fontSize"])
             color_rgb = _int_color_to_rgb(int(s0["colors_dominant"])) if s0.get("colors_dominant") is not None else None
             bold = bool(s0.get("bold", False)); italic = bool(s0.get("italic", False))
-            line_items = [OrderedDict([
-                ("text", l["text"]),
-                ("bbox", [float(l["left"]), float(l["top"]), float(l["right"]), float(l["bottom"])])
-            ]) for l in glines]
+            # lineHeight (median of line heights in this group)
+            line_height = float(_median([l["height"] for l in glines], dom_size * 1.2))
             elements.append(OrderedDict([
-                ("id", f"t:{page_idx}:{next_id}"), ("type", "text"), ("content", content),
-                ("font", dom_font), ("fontSize", dom_size),
+                ("id", f"t:{page_idx}:{next_id}"),
+                ("type", "text"),
+                ("content", content),
+                ("font", dom_font),
+                ("fontSize", dom_size),
+                ("lineHeight", line_height),
                 ("bbox", [float(left), float(top), float(right), float(bottom)]),
-                ("color", color_rgb), ("bold", bold), ("italic", italic),
-                ("underline", False), ("strike", False),
-                ("lines", line_items)
+                ("color", color_rgb),
+                ("bold", bold),
+                ("italic", italic),
+                ("underline", False),
+                ("strike", False)
             ]))
             next_id += 1
 
-        # bitmap images (xref + bbox)
         for z_idx, img in enumerate(page.get_images(full=True)):
             xref = int(img[0]); smask = img[1]
             width = int(img[2]) if len(img) > 2 else None
@@ -336,25 +345,21 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
             ]))
             next_id += 1
 
-        # vector shapes
         shapes = _shapes_from_drawings(page)
         for s in shapes:
             s["id"] = f"v:{page_idx}:{next_id}"
             elements.append(s); next_id += 1
 
-        # annotations
         annots = _annots_from_page(page)
         for a in annots:
             a["id"] = f"a:{page_idx}:{next_id}"
             elements.append(a); next_id += 1
 
-        # page meta
         width_pt = float(page.rect.width)
         height_pt = float(page.rect.height)
         orientation = "portrait" if height_pt >= width_pt else "landscape"
         iso = _classify_page_iso(width_pt, height_pt)
 
-        # background raster (data URI)
         background = None
         if bg_enable:
             try:
@@ -366,7 +371,6 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
             except Exception:
                 background = None
 
-        # heuristic background element ids (large + early)
         bg_ids = []
         page_area = width_pt * height_pt if (width_pt and height_pt) else 1.0
         for el in elements:
@@ -375,7 +379,7 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
                 area = max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
                 area_ratio = area / page_area if page_area else 0.0
                 z = el.get("zIndex", 0)
-                if area_ratio >= 0.7 and z <= 2:  # tune thresholds as needed
+                if area_ratio >= 0.7 and z <= 2:
                     bg_ids.append(el["id"])
 
         pages.append(OrderedDict([
@@ -408,7 +412,6 @@ def convert_pdf_to_html():
     f = request.files['file']
     filename = secure_filename(f.filename or 'upload.pdf')
     upload_id = request.form.get('uploadId') or 'unknown'
-    # background toggles
     bg_flag = request.form.get('bg', request.args.get('bg', '1'))
     bg_dpi = int(request.form.get('bgDpi', request.args.get('bgDpi', '150')))
     bg_enable = str(bg_flag).lower() not in ('0','false','no')
