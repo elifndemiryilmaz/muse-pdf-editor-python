@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
 from collections import OrderedDict, Counter
-import os, re, statistics, base64, fitz
+import os, re, statistics, base64, math, fitz
 from bs4 import BeautifulSoup
 import html as html_escape
 
@@ -114,7 +114,6 @@ def html_to_pages_from_string(html_str: str):
         if not content_text: continue
         bbox = [x, y, x + w, y + h] if (w and h) else [x, y, x, y]
         line_height = float(h) if h > 0 else float(size) * 1.2
-        # HTML content (single span)
         rgb = color_rgb or [0,0,0]
         weight = "bold" if b else "normal"
         style_i = "italic" if i else "normal"
@@ -126,6 +125,7 @@ def html_to_pages_from_string(html_str: str):
             ("id", f"t:1:{next_id}"), ("type", "text"),
             ("content", content_html),
             ("font", font), ("fontSize", float(size)), ("lineHeight", float(line_height)),
+            ("rotation", 0.0),
             ("bbox", [float(b) for b in bbox]),
             ("color", color_rgb), ("bold", bool(b)), ("italic", bool(i)),
             ("underline", bool(u)), ("strike", bool(s))
@@ -150,12 +150,21 @@ def _build_lines_from_spans(page_dict):
                 fonts.append(sp.get("font", "") or ""); sizes.append(float(sp.get("size", 0))); colors.append(int(sp.get("color", 0)))
             line_text = "".join(text_parts).strip()
             if not line_text: continue
+            # rotation from line direction vector if present (dir: [dx, dy])
+            angle_deg = 0.0
+            try:
+                dir_vec = line.get("dir")
+                if dir_vec and len(dir_vec) == 2:
+                    angle_deg = math.degrees(math.atan2(float(dir_vec[1]), float(dir_vec[0])))
+            except Exception:
+                angle_deg = 0.0
             lines.append({
                 "text": line_text,
                 "left": float(min(x0s)), "top": float(min(y0s)),
                 "right": float(max(x1s)), "bottom": float(max(y1s)),
                 "height": float(max(y1s) - min(y0s)),
-                "fonts": fonts, "sizes": sizes, "colors": colors
+                "fonts": fonts, "sizes": sizes, "colors": colors,
+                "angle": float(angle_deg)
             })
     lines.sort(key=lambda l: (l["top"], l["left"]))
     return lines
@@ -225,7 +234,8 @@ def _shapes_from_drawings(page):
             ("miterLimit", miter),
             ("opacity", opacity),
             ("blendMode", blendmode),
-            ("zIndex", idx)
+            ("zIndex", idx),
+            ("rotation", 0.0)  # rotation of vector shapes not trivially available; default 0
         ]))
     return out
 
@@ -319,6 +329,9 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
             color_rgb = _int_color_to_rgb(int(s0["colors_dominant"])) if s0.get("colors_dominant") is not None else None
             bold = bool(s0.get("bold", False)); italic = bool(s0.get("italic", False))
             line_height = float(_median([l["height"] for l in glines], dom_size * 1.2))
+            # rotation: median of line angles in group
+            angles = [float(l.get("angle", 0.0)) for l in glines]
+            rotation = float(_median(angles, 0.0))
             # HTML content: lines joined with <br/>
             safe_lines = [html_escape.escape(l["text"]) for l in glines]
             rgb = color_rgb or [0, 0, 0]
@@ -336,6 +349,7 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
                 ("font", dom_font),
                 ("fontSize", dom_size),
                 ("lineHeight", line_height),
+                ("rotation", rotation),
                 ("bbox", [float(left), float(top), float(right), float(bottom)]),
                 ("color", color_rgb),
                 ("bold", bold),
@@ -359,7 +373,8 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
                 ("bbox", bbox), ("xref", xref),
                 ("naturalSize", OrderedDict([("width", width), ("height", height)])),
                 ("bitsPerComponent", bpc), ("colorSpace", cs),
-                ("hasAlpha", bool(has_alpha)), ("zIndex", z_idx)
+                ("hasAlpha", bool(has_alpha)), ("zIndex", z_idx),
+                ("rotation", 0.0)
             ]))
             next_id += 1
 
