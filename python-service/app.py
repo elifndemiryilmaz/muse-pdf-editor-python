@@ -4,6 +4,7 @@ from flask_cors import CORS
 from collections import OrderedDict, Counter
 import os, re, statistics, base64, fitz
 from bs4 import BeautifulSoup
+import html as html_escape
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, methods=["GET", "POST", "OPTIONS"],
@@ -67,56 +68,6 @@ def _css_flags(style: dict):
     strike = ("line-through" in td) or ("strikethrough" in td)
     return bold, italic, underline, strike
 
-# Interpret PyMuPDF span flags into booleans
-def _interpret_font_flags(flags: int):
-    try:
-        f = int(flags)
-    except Exception:
-        f = 0
-    return {
-        "superscript": bool(f & 1),
-        "italic": bool(f & 2),
-        "serif": bool(f & 4),
-        "monospace": bool(f & 8),
-        "bold": bool(f & 16),
-    }
-
-# Split subset prefix from a PostScript font name like "EAAAC+Helvetica-Bold"
-def _split_subset_font_name(font_name: str):
-    if not font_name:
-        return None, ""
-    if "+" in font_name:
-        prefix, base = font_name.split("+", 1)
-        if prefix and base:
-            return prefix + "+", base
-    return None, font_name
-
-# Guess a human family name from a PostScript name
-def _guess_font_family_from_postscript(name: str) -> str:
-    if not name:
-        return ""
-    _, base = _split_subset_font_name(name)
-    fam = base.split("-", 1)[0] if base else name
-    return fam or name
-
-# Choose a reasonable CSS fallback stack based on hints
-def _fallback_stack_for_font(is_serif: bool, is_monospace: bool) -> str:
-    if is_monospace:
-        return 'Menlo, Monaco, Consolas, "Liberation Mono", monospace'
-    if is_serif:
-        return 'Georgia, "Times New Roman", Times, serif'
-    return '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif'
-
-def _font_mime_from_ext(ext: str) -> str:
-    e = (ext or "").lower().strip('.')
-    if e == "ttf": return "font/ttf"
-    if e == "otf": return "font/otf"
-    if e == "woff": return "font/woff"
-    if e == "woff2": return "font/woff2"
-    if e in ("pfb", "pfa", "type1"): return "application/x-font-type1"
-    if e == "cff": return "font/otf"
-    return "application/octet-stream"
-
 def _mean(values, default=0.0):
     try: return statistics.mean(values) if values else default
     except statistics.StatisticsError: return default
@@ -125,7 +76,6 @@ def _median(values, default=0.0):
     try: return statistics.median(values) if values else default
     except statistics.StatisticsError: return default
 
-#Pick the most frequent value in a list (e.g., the main font or color for a line).
 def _dominant(items):
     if not items: return None
     return Counter(items).most_common(1)[0][0]
@@ -138,8 +88,6 @@ def _style_equal(a, b, size_tol=0.5):
     if bool(a.get("italic", False)) != bool(b.get("italic", False)): return False
     return True
 
-#PyMuPDF drawing APIs sometimes return colors as tuples in [0..1] floats (e.g., (0.5, 0.2, 0.1))
-#  or 0–255 ints. To have consistent [r, g, b] bytes.
 def _rgb_from_tuple(t):
     if t is None: return None
     vals = list(t)
@@ -162,13 +110,21 @@ def html_to_pages_from_string(html_str: str):
         font = (style.get("font-family", "") or "").replace('"', "")
         color_rgb = _css_color_to_rgb(style.get("color"))
         b,i,u,s = _css_flags(style)
-        content = (span.get_text() or "").strip()
-        if not content: continue
+        content_text = (span.get_text() or "").strip()
+        if not content_text: continue
         bbox = [x, y, x + w, y + h] if (w and h) else [x, y, x, y]
-        # approximate line height from CSS height if present, else from font size
         line_height = float(h) if h > 0 else float(size) * 1.2
+        # HTML content (single span)
+        rgb = color_rgb or [0,0,0]
+        weight = "bold" if b else "normal"
+        style_i = "italic" if i else "normal"
+        deco = "underline" if u else ("line-through" if s else "none")
+        safe = html_escape.escape(content_text)
+        style_attr = f"font-family:{font}; font-size:{size}pt; line-height:{line_height}pt; color:rgb({rgb[0]},{rgb[1]},{rgb[2]}); font-weight:{weight}; font-style:{style_i}; text-decoration:{deco}; margin:0;"
+        content_html = f'<p style="{style_attr}">{safe}</p>'
         elements.append(OrderedDict([
-            ("id", f"t:1:{next_id}"), ("type", "text"), ("content", content),
+            ("id", f"t:1:{next_id}"), ("type", "text"),
+            ("content", content_html),
             ("font", font), ("fontSize", float(size)), ("lineHeight", float(line_height)),
             ("bbox", [float(b) for b in bbox]),
             ("color", color_rgb), ("bold", bool(b)), ("italic", bool(i)),
@@ -185,17 +141,13 @@ def _build_lines_from_spans(page_dict):
         for line in block["lines"]:
             spans = line.get("spans", [])
             if not spans: continue
-            text_parts, x0s, y0s, x1s, y1s, fonts, sizes, colors, flags = [], [], [], [], [], [], [], [], []
+            text_parts, x0s, y0s, x1s, y1s, fonts, sizes, colors = [], [], [], [], [], [], [], []
             for sp in spans:
                 t = sp.get("text", "") or ""
                 bx = sp.get("bbox", [0,0,0,0])
                 if t: text_parts.append(t)
                 x0s.append(bx[0]); y0s.append(bx[1]); x1s.append(bx[2]); y1s.append(bx[3])
                 fonts.append(sp.get("font", "") or ""); sizes.append(float(sp.get("size", 0))); colors.append(int(sp.get("color", 0)))
-                try:
-                    flags.append(int(sp.get("flags", 0)))
-                except Exception:
-                    flags.append(0)
             line_text = "".join(text_parts).strip()
             if not line_text: continue
             lines.append({
@@ -203,7 +155,7 @@ def _build_lines_from_spans(page_dict):
                 "left": float(min(x0s)), "top": float(min(y0s)),
                 "right": float(max(x1s)), "bottom": float(max(y1s)),
                 "height": float(max(y1s) - min(y0s)),
-                "fonts": fonts, "sizes": sizes, "colors": colors, "flags": flags
+                "fonts": fonts, "sizes": sizes, "colors": colors
             })
     lines.sort(key=lambda l: (l["top"], l["left"]))
     return lines
@@ -215,10 +167,8 @@ def _group_by_avg_gap_and_style(lines):
         pos = [s for s in l["sizes"] if s > 0]
         l["fontSize"] = float(_median(pos, 12.0))
         l["colors_dominant"] = _dominant(l["colors"]) if l["colors"] else 0
-        dom_flag = _dominant(l.get("flags", [])) or 0
-        fflags = _interpret_font_flags(dom_flag)
-        l["bold"] = bool(fflags.get("bold")) or _infer_bold_from_font(l["font"])
-        l["italic"] = bool(fflags.get("italic")) or _infer_italic_from_font(l["font"])
+        l["bold"] = _infer_bold_from_font(l["font"])
+        l["italic"] = _infer_italic_from_font(l["font"])
     gaps = [max(0.0, lines[i]["top"] - lines[i-1]["bottom"]) for i in range(1, len(lines))]
     avg_gap = _mean(gaps, default=_median([l["height"] for l in lines], 12.0))
     groups, cur = [], [lines[0]]
@@ -349,30 +299,11 @@ def _page_background_data_uri(page, dpi: int = 150):
     return f"data:image/png;base64,{b64}"
 
 # ---------- Main extraction ----------
-def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150, embed_fonts=False):
+def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
     doc = fitz.open(pdf_path)
     pages = []
-    # Accumulate font metadata and (optionally) embedded files
-    fonts_meta = {}
-    fonts_by_name = OrderedDict()
-    fonts_list = []
-    font_xrefs_seen = set()
     for page_idx, page in enumerate(doc, start=1):
         page_dict = page.get_text("dict")
-
-        # Collect page-level font xrefs and names for embedding / catalog
-        try:
-            page_fonts = page.get_fonts(full=True)
-            for f in page_fonts:
-                # PyMuPDF tuple layout (xref, gen, name, basefont, ...), varies by version
-                xref = int(f[0]) if len(f) > 0 else None
-                psname = (f[3] if len(f) > 3 else f[2]) if len(f) > 2 else None
-                if psname:
-                    fonts_by_name.setdefault(psname, None)
-                if xref:
-                    font_xrefs_seen.add(xref)
-        except Exception:
-            pass
 
         lines = _build_lines_from_spans(page_dict)
         groups, avg_gap = _group_by_avg_gap_and_style(lines)
@@ -381,21 +312,28 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150, embed_fonts=False):
         for glines in groups:
             left = min(l["left"] for l in glines); top = min(l["top"] for l in glines)
             right = max(l["right"] for l in glines); bottom = max(l["bottom"] for l in glines)
-            content = "\n".join(l["text"] for l in glines)
+            # style / metrics
             s0 = glines[0]
             dom_font = s0["font"] or ""
             dom_size = float(s0["fontSize"])
             color_rgb = _int_color_to_rgb(int(s0["colors_dominant"])) if s0.get("colors_dominant") is not None else None
             bold = bool(s0.get("bold", False)); italic = bool(s0.get("italic", False))
-            # lineHeight (median of line heights in this group)
             line_height = float(_median([l["height"] for l in glines], dom_size * 1.2))
-            # Attach a fontId referencing the fonts catalog (lazy-assign ids later)
+            # HTML content: lines joined with <br/>
+            safe_lines = [html_escape.escape(l["text"]) for l in glines]
+            rgb = color_rgb or [0, 0, 0]
+            weight = "bold" if bold else "normal"
+            style_i = "italic" if italic else "normal"
+            style_attr = (
+                f"font-family:{dom_font}; font-size:{dom_size}pt; line-height:{line_height}pt; "
+                f"color:rgb({rgb[0]},{rgb[1]},{rgb[2]}); font-weight:{weight}; font-style:{style_i}; margin:0;"
+            )
+            content_html = f'<p style="{style_attr}">' + "<br/>".join(safe_lines) + "</p>"
             elements.append(OrderedDict([
                 ("id", f"t:{page_idx}:{next_id}"),
                 ("type", "text"),
-                ("content", content),
+                ("content", content_html),
                 ("font", dom_font),
-                ("fontId", None),
                 ("fontSize", dom_size),
                 ("lineHeight", line_height),
                 ("bbox", [float(left), float(top), float(right), float(bottom)]),
@@ -477,117 +415,8 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150, embed_fonts=False):
             ("elements", elements),
         ]))
 
-    # Build fonts catalog from observed names and optionally embed
-    name_to_id = {}
-    idx = 0
-    for psname in fonts_by_name.keys():
-        fid = f"f:{idx}"; idx += 1
-        name_to_id[psname] = fid
-        prefix, base = _split_subset_font_name(psname)
-        meta = {
-            "id": fid,
-            "postscriptName": psname,
-            "baseName": base,
-            "subsetPrefix": prefix,
-            "weight": 400,
-            "style": "normal",
-            "monospace": False,
-            "serif": False,
-            "sizeMin": None,
-            "sizeMax": None,
-            "fallbackStack": _fallback_stack_for_font(False, False),
-        }
-        fonts_list.append(OrderedDict(meta))
-
-    # Derive weight/style / metrics from fonts_meta collected from spans
-    # (We reuse line-level heuristics: bold/italic flags and observed sizes)
-    # Collect span-level info now
-    # Re-open and iterate spans to aggregate sizes and flags per PostScript name
-    try:
-        doc2 = fitz.open(pdf_path)
-        for page in doc2:
-            pd = page.get_text("dict")
-            for block in pd.get("blocks", []):
-                if "lines" not in block: continue
-                for line in block["lines"]:
-                    for sp in line.get("spans", []):
-                        name = (sp.get("font", "") or "")
-                        if not name: continue
-                        try:
-                            fl = int(sp.get("flags", 0))
-                        except Exception:
-                            fl = 0
-                        size = float(sp.get("size", 0) or 0)
-                        info = fonts_meta.get(name)
-                        if not info:
-                            info = {"sizes": [], "bold": False, "italic": False, "monospace": False, "serif": False}
-                            fonts_meta[name] = info
-                        fflags = _interpret_font_flags(fl)
-                        info["bold"] = bool(info["bold"] or fflags["bold"] or _infer_bold_from_font(name))
-                        info["italic"] = bool(info["italic"] or fflags["italic"] or _infer_italic_from_font(name))
-                        info["monospace"] = bool(info["monospace"] or fflags["monospace"]) 
-                        info["serif"] = bool(info["serif"] or fflags["serif"]) 
-                        if size > 0:
-                            info["sizes"].append(size)
-        doc2.close()
-    except Exception:
-        pass
-
-    # Apply collected info to catalog
-    for fobj in fonts_list:
-        psname = fobj["postscriptName"]
-        info = fonts_meta.get(psname, {"sizes": [], "bold": False, "italic": False, "monospace": False, "serif": False})
-        sizes = info.get("sizes", [])
-        fobj["sizeMin"] = float(min(sizes)) if sizes else None
-        fobj["sizeMax"] = float(max(sizes)) if sizes else None
-        fobj["weight"] = 700 if info.get("bold") else 400
-        fobj["style"] = "italic" if info.get("italic") else "normal"
-        fobj["monospace"] = bool(info.get("monospace"))
-        fobj["serif"] = bool(info.get("serif"))
-        fobj["fallbackStack"] = _fallback_stack_for_font(fobj["serif"], fobj["monospace"]) 
-
-    # Optionally embed font files
-    if embed_fonts and font_xrefs_seen:
-        for f in page.get_fonts(full=True) if False else []:
-            pass  # placeholder to satisfy static analyzers
-        for xref in list(font_xrefs_seen):
-            try:
-                base_name, ext, ftype, content = doc.extract_font(xref)
-                if content:
-                    ps_candidates = [base_name]
-                    # Map content to a catalog entry by postscript or baseName
-                    for fobj in fonts_list:
-                        if fobj["postscriptName"] == base_name or fobj["baseName"] == base_name:
-                            mime = _font_mime_from_ext(ext)
-                            data_uri = "data:%s;base64,%s" % (mime, base64.b64encode(content).decode("ascii"))
-                            fobj["file"] = OrderedDict([
-                                ("ext", ext),
-                                ("type", ftype),
-                                ("mime", mime),
-                                ("dataUri", data_uri),
-                            ])
-                            fobj["embedded"] = True
-            except Exception:
-                pass
-
-    # Assign fontId to text elements where possible
-    base_to_id = {}
-    for fobj in fonts_list:
-        bname = fobj.get("baseName")
-        if bname:
-            base_to_id[bname] = fobj.get("id")
-    for page in pages:
-        for el in page.get("elements", []):
-            if el.get("type") == "text":
-                name = el.get("font") or ""
-                fid = name_to_id.get(name)
-                if not fid:
-                    fid = base_to_id.get(name)
-                if fid:
-                    el["fontId"] = fid
-
     doc.close()
-    return pages, fonts_list
+    return pages
 
 # ---------- Routes ----------
 @app.get('/health')
@@ -604,18 +433,15 @@ def convert_pdf_to_html():
     bg_flag = request.form.get('bg', request.args.get('bg', '1'))
     bg_dpi = int(request.form.get('bgDpi', request.args.get('bgDpi', '150')))
     bg_enable = str(bg_flag).lower() not in ('0','false','no')
-    embed_flag = request.form.get('embedFonts', request.args.get('embedFonts', '0'))
-    embed_fonts = str(embed_flag).lower() in ('1','true','yes')
 
     file_path = os.path.join(UPLOAD_DIR, filename)
     f.save(file_path)
     try:
-        pages, fonts = pdf_to_pages(file_path, bg_enable=bg_enable, bg_dpi=bg_dpi, embed_fonts=embed_fonts)
+        pages = pdf_to_pages(file_path, bg_enable=bg_enable, bg_dpi=bg_dpi)
         return jsonify(OrderedDict([
             ("filename", filename),
             ("uploadId", upload_id),
             ("pages", pages),
-            ("fonts", fonts),
         ]))
     except Exception as e:
         return jsonify({"error": f"{e}"}), 500
