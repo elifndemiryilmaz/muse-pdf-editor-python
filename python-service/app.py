@@ -3,8 +3,7 @@ from werkzeug.utils import secure_filename
 from flask_cors import CORS
 from collections import OrderedDict, Counter
 import os, re, statistics, base64, math, fitz
-from bs4 import BeautifulSoup
-import html as html_escape
+from bs4 import BeautifulSoup  # kept for html_to_pages utility if needed
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, methods=["GET", "POST", "OPTIONS"],
@@ -15,6 +14,7 @@ UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
 OUTPUT_DIR = os.path.join(BASE_DIR, 'outputs')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Fonts directory removed (mutool usage discarded)
 
 PT_TO_MM = 25.4 / 72.0  # 1 pt = 1/72 inch
 
@@ -95,7 +95,7 @@ def _rgb_from_tuple(t):
     if max(vals) <= 1.0: vals = [int(round(v*255)) for v in vals]
     return [int(v) for v in vals[:3]]
 
-# ---------- HTML path (utility) ----------
+# ---------- HTML utility (kept, but content here remains plain text) ----------
 def html_to_pages_from_string(html_str: str):
     soup = BeautifulSoup(html_str, "lxml")
     elements, next_id = [], 0
@@ -114,16 +114,9 @@ def html_to_pages_from_string(html_str: str):
         if not content_text: continue
         bbox = [x, y, x + w, y + h] if (w and h) else [x, y, x, y]
         line_height = float(h) if h > 0 else float(size) * 1.2
-        rgb = color_rgb or [0,0,0]
-        weight = "bold" if b else "normal"
-        style_i = "italic" if i else "normal"
-        deco = "underline" if u else ("line-through" if s else "none")
-        safe = html_escape.escape(content_text)
-        style_attr = f"font-family:{font}; font-size:{size}pt; line-height:{line_height}pt; color:rgb({rgb[0]},{rgb[1]},{rgb[2]}); font-weight:{weight}; font-style:{style_i}; text-decoration:{deco}; margin:0;"
-        content_html = f'<p style="{style_attr}">{safe}</p>'
         elements.append(OrderedDict([
             ("id", f"t:1:{next_id}"), ("type", "text"),
-            ("content", content_html),
+            ("content", content_text),  # plain text
             ("font", font), ("fontSize", float(size)), ("lineHeight", float(line_height)),
             ("rotation", 0.0),
             ("bbox", [float(b) for b in bbox]),
@@ -150,7 +143,6 @@ def _build_lines_from_spans(page_dict):
                 fonts.append(sp.get("font", "") or ""); sizes.append(float(sp.get("size", 0))); colors.append(int(sp.get("color", 0)))
             line_text = "".join(text_parts).strip()
             if not line_text: continue
-            # rotation from line direction vector if present (dir: [dx, dy])
             angle_deg = 0.0
             try:
                 dir_vec = line.get("dir")
@@ -235,43 +227,10 @@ def _shapes_from_drawings(page):
             ("opacity", opacity),
             ("blendMode", blendmode),
             ("zIndex", idx),
-            ("rotation", 0.0)  # rotation of vector shapes not trivially available; default 0
+            ("rotation", 0.0)
         ]))
     return out
 
-# ---------- Annotations ----------
-def _annots_from_page(page):
-    out, i = [], 0
-    try:
-        a = page.first_annot
-    except Exception:
-        a = None
-    while a:
-        typ = None
-        try: typ = a.type[1]
-        except Exception: pass
-        r = a.rect
-        info, colors = {}, {}
-        try: info = a.info or {}
-        except Exception: pass
-        try: colors = a.colors or {}
-        except Exception: pass
-        subtype = info.get("name") or typ
-        contents = info.get("content")
-        title = info.get("title")
-        out.append(OrderedDict([
-            ("id", None),
-            ("type", "annotation"),
-            ("page", page.number+1),
-            ("subtype", subtype),
-            ("bbox", [float(r.x0), float(r.y0), float(r.x1), float(r.y1)]),
-            ("title", title),
-            ("contents", contents),
-            ("colors", colors)
-        ]))
-        i += 1
-        a = a.next
-    return out
 
 # ---------- ISO sizes ----------
 _KNOWN_SIZES_MM = OrderedDict([
@@ -299,17 +258,12 @@ def _classify_page_iso(width_pt: float, height_pt: float):
         return best_name
     return "Unknown"
 
-# ---------- Background raster ----------
-def _page_background_data_uri(page, dpi: int = 150):
-    scale = dpi / 72.0
-    mat = fitz.Matrix(scale, scale)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    data = pix.tobytes("png")
-    b64 = base64.b64encode(data).decode("ascii")
-    return f"data:image/png;base64,{b64}"
+
+
+# ---------- Font extraction (removed) ----------
 
 # ---------- Main extraction ----------
-def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
+def pdf_to_pages(pdf_path, bg_enable=False, bg_dpi=150, upload_id_for_fonts=None):
     doc = fitz.open(pdf_path)
     pages = []
     for page_idx, page in enumerate(doc, start=1):
@@ -322,30 +276,20 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
         for glines in groups:
             left = min(l["left"] for l in glines); top = min(l["top"] for l in glines)
             right = max(l["right"] for l in glines); bottom = max(l["bottom"] for l in glines)
-            # style / metrics
             s0 = glines[0]
             dom_font = s0["font"] or ""
             dom_size = float(s0["fontSize"])
             color_rgb = _int_color_to_rgb(int(s0["colors_dominant"])) if s0.get("colors_dominant") is not None else None
             bold = bool(s0.get("bold", False)); italic = bool(s0.get("italic", False))
             line_height = float(_median([l["height"] for l in glines], dom_size * 1.2))
-            # rotation: median of line angles in group
             angles = [float(l.get("angle", 0.0)) for l in glines]
             rotation = float(_median(angles, 0.0))
-            # HTML content: lines joined with <br/>
-            safe_lines = [html_escape.escape(l["text"]) for l in glines]
-            rgb = color_rgb or [0, 0, 0]
-            weight = "bold" if bold else "normal"
-            style_i = "italic" if italic else "normal"
-            style_attr = (
-                f"font-family:{dom_font}; font-size:{dom_size}pt; line-height:{line_height}pt; "
-                f"color:rgb({rgb[0]},{rgb[1]},{rgb[2]}); font-weight:{weight}; font-style:{style_i}; margin:0;"
-            )
-            content_html = f'<p style="{style_attr}">' + "<br/>".join(safe_lines) + "</p>"
+            # content as plain text with newline separators
+            content_text = "\n".join(l["text"] for l in glines)
             elements.append(OrderedDict([
                 ("id", f"t:{page_idx}:{next_id}"),
                 ("type", "text"),
-                ("content", content_html),
+                ("content", content_text),  # plain text
                 ("font", dom_font),
                 ("fontSize", dom_size),
                 ("lineHeight", line_height),
@@ -383,37 +327,11 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
             s["id"] = f"v:{page_idx}:{next_id}"
             elements.append(s); next_id += 1
 
-        annots = _annots_from_page(page)
-        for a in annots:
-            a["id"] = f"a:{page_idx}:{next_id}"
-            elements.append(a); next_id += 1
 
         width_pt = float(page.rect.width)
         height_pt = float(page.rect.height)
         orientation = "portrait" if height_pt >= width_pt else "landscape"
         iso = _classify_page_iso(width_pt, height_pt)
-
-        background = None
-        if bg_enable:
-            try:
-                background = OrderedDict([
-                    ("type", "image"),
-                    ("dpi", int(bg_dpi)),
-                    ("src", _page_background_data_uri(page, dpi=int(bg_dpi)))
-                ])
-            except Exception:
-                background = None
-
-        bg_ids = []
-        page_area = width_pt * height_pt if (width_pt and height_pt) else 1.0
-        for el in elements:
-            if el["type"] in ("image", "shape"):
-                x1,y1,x2,y2 = el["bbox"]
-                area = max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
-                area_ratio = area / page_area if page_area else 0.0
-                z = el.get("zIndex", 0)
-                if area_ratio >= 0.7 and z <= 2:
-                    bg_ids.append(el["id"])
 
         pages.append(OrderedDict([
             ("page", page_idx),
@@ -425,18 +343,20 @@ def pdf_to_pages(pdf_path, bg_enable=True, bg_dpi=150):
                 ("iso", iso),
                 ("orientation", orientation)
             ])),
-            ("background", background),
-            ("backgroundElementIds", bg_ids),
             ("elements", elements),
         ]))
 
     doc.close()
-    return pages
+
+    # Fonts extraction removed
+    return pages, []
 
 # ---------- Routes ----------
 @app.get('/health')
 def health():
     return jsonify({"status": "ok", "service": "python"})
+
+# Fonts serving route removed (mutool usage discarded)
 
 @app.post('/convert/pdf-to-html')
 def convert_pdf_to_html():
@@ -445,14 +365,11 @@ def convert_pdf_to_html():
     f = request.files['file']
     filename = secure_filename(f.filename or 'upload.pdf')
     upload_id = request.form.get('uploadId') or 'unknown'
-    bg_flag = request.form.get('bg', request.args.get('bg', '1'))
-    bg_dpi = int(request.form.get('bgDpi', request.args.get('bgDpi', '150')))
-    bg_enable = str(bg_flag).lower() not in ('0','false','no')
 
     file_path = os.path.join(UPLOAD_DIR, filename)
     f.save(file_path)
     try:
-        pages = pdf_to_pages(file_path, bg_enable=bg_enable, bg_dpi=bg_dpi)
+        pages, fonts = pdf_to_pages(file_path)
         return jsonify(OrderedDict([
             ("filename", filename),
             ("uploadId", upload_id),
