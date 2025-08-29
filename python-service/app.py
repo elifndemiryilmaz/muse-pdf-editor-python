@@ -170,12 +170,21 @@ def _build_lines_from_spans(page_dict):
             spans = line.get("spans", [])
             if not spans: continue
             text_parts, x0s, y0s, x1s, y1s, fonts, sizes, colors = [], [], [], [], [], [], [], []
+            spans_data = []
             for sp in spans:
                 t = sp.get("text", "") or ""
                 bx = sp.get("bbox", [0,0,0,0])
                 if t: text_parts.append(t)
                 x0s.append(bx[0]); y0s.append(bx[1]); x1s.append(bx[2]); y1s.append(bx[3])
                 fonts.append(sp.get("font", "") or ""); sizes.append(float(sp.get("size", 0))); colors.append(int(sp.get("color", 0)))
+                if t:
+                    spans_data.append({
+                        "text": t,
+                        "bbox": [float(bx[0]), float(bx[1]), float(bx[2]), float(bx[3])],
+                        "font": sp.get("font", "") or "",
+                        "size": float(sp.get("size", 0)),
+                        "color": int(sp.get("color", 0))
+                    })
             line_text = "".join(text_parts).strip()
             if not line_text: continue
             angle_deg = 0.0
@@ -191,7 +200,8 @@ def _build_lines_from_spans(page_dict):
                 "right": float(max(x1s)), "bottom": float(max(y1s)),
                 "height": float(max(y1s) - min(y0s)),
                 "fonts": fonts, "sizes": sizes, "colors": colors,
-                "angle": float(angle_deg)
+                "angle": float(angle_deg),
+                "spans_data": spans_data
             })
     lines.sort(key=lambda l: (l["top"], l["left"]))
     return lines
@@ -428,36 +438,190 @@ def pdf_to_pages(pdf_path, scale=1.0):
         groups, _ = _group_by_avg_gap_and_style(lines)
 
         elements, next_id = [], 0
-        # Text elements (plain text content)
+        # Text elements: cluster into visual rows, split by long spaces and geometric gaps on the same row
         for glines in groups:
-            left = min(l["left"] for l in glines); top = min(l["top"] for l in glines)
-            right = max(l["right"] for l in glines); bottom = max(l["bottom"] for l in glines)
             s0 = glines[0]
             dom_font = s0["font"] or ""
             dom_size = float(s0["fontSize"])
             color_rgb = _int_color_to_rgb(int(s0["colors_dominant"])) if s0.get("colors_dominant") is not None else None
-            bold = bool(s0.get("bold", False)); italic = bool(s0.get("italic", False))
             line_height = float(_median([l["height"] for l in glines], dom_size * 1.2))
             angles = [float(l.get("angle", 0.0)) for l in glines]
             rotation = float(_median(angles, 0.0))
-            content_text = "\n".join(l["text"] for l in glines)
 
-            elements.append(OrderedDict([
-                ("id", f"t:{page_idx}:{next_id}"),
-                ("type", "text"),
-                ("content", content_text),
-                ("font", dom_font),
-                ("fontSize", dom_size),
-                ("lineHeight", line_height),
-                ("rotation", rotation),
-                ("bbox", [float(left), float(top), float(right), float(bottom)]),
-                ("color", color_rgb),
-                ("bold", bold),
-                ("italic", italic),
-                ("underline", False),
-                ("strike", False)
-            ]))
-            next_id += 1
+            splitter = re.compile(r"\s{5,}")
+
+            # Cluster lines into rows by similar top
+            row_tol = 1.0
+            rows, cur_row, cur_top = [], [], None
+            for ln in glines:
+                if cur_top is None or abs(ln["top"] - cur_top) <= row_tol:
+                    cur_row.append(ln)
+                    if cur_top is None:
+                        cur_top = ln["top"]
+                else:
+                    rows.append(cur_row)
+                    cur_row = [ln]
+                    cur_top = ln["top"]
+            if cur_row:
+                rows.append(cur_row)
+
+            # Aggregate rows without splits, emit components for rows with splits
+            agg_left = agg_top = agg_right = agg_bottom = None
+            agg_text_lines = []
+            agg_fonts, agg_sizes, agg_colors = [], [], []
+
+            for row in rows:
+                # Flatten spans in this row and sort left-to-right
+                row_spans = []
+                for ln in row:
+                    row_spans.extend(ln.get("spans_data", []))
+                row_spans = sorted(row_spans, key=lambda sp: sp["bbox"][0])
+
+                row_left = min(l["left"] for l in row); row_top = min(l["top"] for l in row)
+                row_right = max(l["right"] for l in row); row_bottom = max(l["bottom"] for l in row)
+                row_text = " ".join(l["text"] for l in row)
+
+                has_long_space = any(splitter.search(sp.get("text", "")) for sp in row_spans)
+                row_sizes = [float(sp.get("size", dom_size)) for sp in row_spans] or [dom_size]
+                row_size_dom = float(_dominant(row_sizes)) if row_sizes else dom_size
+                X_GAP_TOL = max(1.0, row_size_dom * 1.5)
+                has_geom_gap = any(
+                    (row_spans[i+1]["bbox"][0] - row_spans[i]["bbox"][2]) > X_GAP_TOL
+                    for i in range(len(row_spans) - 1)
+                )
+
+                if not (has_long_space or has_geom_gap):
+                    # Accumulate row into aggregated paragraph
+                    agg_text_lines.append(row_text)
+                    if agg_left is None:
+                        agg_left, agg_top, agg_right, agg_bottom = row_left, row_top, row_right, row_bottom
+                    else:
+                        agg_left = min(agg_left, row_left)
+                        agg_top = min(agg_top, row_top)
+                        agg_right = max(agg_right, row_right)
+                        agg_bottom = max(agg_bottom, row_bottom)
+                    # Accumulate styles from this row's spans
+                    for sp in row_spans:
+                        agg_fonts.append(sp.get("font", "") or "")
+                        try:
+                            agg_sizes.append(float(sp.get("size", dom_size)))
+                        except Exception:
+                            pass
+                        try:
+                            agg_colors.append(int(sp.get("color", 0)))
+                        except Exception:
+                            pass
+                    continue
+
+                # Split this row into components using long spaces and geometric gaps
+                cur_text = ""
+                cur_left = cur_top = cur_right = cur_bottom = None
+                comp_fonts, comp_sizes, comp_colors = [], [], []
+
+                def flush_component():
+                    nonlocal cur_text, cur_left, cur_top, cur_right, cur_bottom, comp_fonts, comp_sizes, comp_colors, next_id
+                    txt = cur_text.strip()
+                    if txt and cur_left is not None:
+                        comp_font = _dominant(comp_fonts) or dom_font
+                        comp_size = float(_dominant(comp_sizes) if comp_sizes else dom_size)
+                        comp_color_int = _dominant(comp_colors) if comp_colors else None
+                        comp_color_rgb = _int_color_to_rgb(int(comp_color_int)) if comp_color_int is not None else color_rgb
+                        comp_bold = _infer_bold_from_font(comp_font)
+                        comp_italic = _infer_italic_from_font(comp_font)
+                        elements.append(OrderedDict([
+                            ("id", f"t:{page_idx}:{next_id}"),
+                            ("type", "text"),
+                            ("content", txt),
+                            ("font", comp_font),
+                            ("fontSize", comp_size),
+                            ("lineHeight", line_height),
+                            ("rotation", rotation),
+                            ("bbox", [float(cur_left), float(cur_top), float(cur_right), float(cur_bottom)]),
+                            ("color", comp_color_rgb),
+                            ("bold", comp_bold),
+                            ("italic", comp_italic),
+                            ("underline", False),
+                            ("strike", False)
+                        ]))
+                        next_id += 1
+                    cur_text = ""
+                    cur_left = cur_top = cur_right = cur_bottom = None
+                    comp_fonts, comp_sizes, comp_colors = [], [], []
+
+                prev_right = None
+                for sp in row_spans:
+                    t = sp["text"]
+                    bx = sp["bbox"]
+                    # Geometric split between spans
+                    if prev_right is not None and (bx[0] - prev_right) > X_GAP_TOL:
+                        flush_component()
+                    prev_right = bx[2]
+
+                    w = max(0.0, bx[2] - bx[0])
+                    n = max(1, len(t))
+                    parts = []
+                    last = 0
+                    for m in splitter.finditer(t):
+                        parts.append((t[last:m.start()], last, m.start()))
+                        last = m.end()
+                    parts.append((t[last:], last, len(t)))
+
+                    for idx, (ptxt, a, b) in enumerate(parts):
+                        x0p = bx[0] + (w * (a / n))
+                        x1p = bx[0] + (w * (b / n))
+                        slice_bbox = [x0p, bx[1], x1p, bx[3]]
+
+                        content_piece = (ptxt or "").strip()
+                        if content_piece:
+                            if cur_left is None:
+                                cur_left, cur_top, cur_right, cur_bottom = slice_bbox
+                                cur_text = content_piece
+                            else:
+                                cur_left = min(cur_left, slice_bbox[0])
+                                cur_top = min(cur_top, slice_bbox[1])
+                                cur_right = max(cur_right, slice_bbox[2])
+                                cur_bottom = max(cur_bottom, slice_bbox[3])
+                                cur_text = (cur_text + " " + content_piece).strip()
+                            comp_fonts.append(sp.get("font", "") or "")
+                            try:
+                                comp_sizes.append(float(sp.get("size", dom_size)))
+                            except Exception:
+                                pass
+                            try:
+                                comp_colors.append(int(sp.get("color", 0)))
+                            except Exception:
+                                pass
+
+                        if idx < len(parts) - 1:
+                            flush_component()
+
+                flush_component()
+
+            # Emit one aggregated paragraph element if we accumulated any rows
+            if agg_text_lines:
+                comp_font = _dominant(agg_fonts) or dom_font
+                comp_size = float(_dominant(agg_sizes) if agg_sizes else dom_size)
+                comp_color_int = _dominant(agg_colors) if agg_colors else None
+                comp_color_rgb = _int_color_to_rgb(int(comp_color_int)) if comp_color_int is not None else color_rgb
+                comp_bold = _infer_bold_from_font(comp_font)
+                comp_italic = _infer_italic_from_font(comp_font)
+                content_text = "\n".join(agg_text_lines)
+                elements.append(OrderedDict([
+                    ("id", f"t:{page_idx}:{next_id}"),
+                    ("type", "text"),
+                    ("content", content_text),
+                    ("font", comp_font),
+                    ("fontSize", comp_size),
+                    ("lineHeight", line_height),
+                    ("rotation", rotation),
+                    ("bbox", [float(agg_left), float(agg_top), float(agg_right), float(agg_bottom)]),
+                    ("color", comp_color_rgb),
+                    ("bold", comp_bold),
+                    ("italic", comp_italic),
+                    ("underline", False),
+                    ("strike", False)
+                ]))
+                next_id += 1
 
         # Bitmap images
         elements.extend(_extract_images_as_elements(doc, page, scale=scale))
