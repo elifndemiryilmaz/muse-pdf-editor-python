@@ -3,7 +3,8 @@ from werkzeug.utils import secure_filename
 from flask_cors import CORS
 from collections import OrderedDict, Counter
 import os, re, statistics, base64, math, fitz
-from bs4 import BeautifulSoup  # kept for html_to_pages utility if needed
+from bs4 import BeautifulSoup  # kept for html_to_pages utility
+from PIL import Image, ImageDraw
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, methods=["GET", "POST", "OPTIONS"],
@@ -14,11 +15,11 @@ UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
 OUTPUT_DIR = os.path.join(BASE_DIR, 'outputs')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-# Fonts directory removed (mutool usage discarded)
 
 PT_TO_MM = 25.4 / 72.0  # 1 pt = 1/72 inch
 
-# ---------- Helpers ----------
+# ============ Helpers ============
+
 def parse_style(style_str: str):
     style_dict = {}
     for part in style_str.split(";"):
@@ -95,7 +96,41 @@ def _rgb_from_tuple(t):
     if max(vals) <= 1.0: vals = [int(round(v*255)) for v in vals]
     return [int(v) for v in vals[:3]]
 
-# ---------- HTML utility (kept, but content here remains plain text) ----------
+def _draw_img_to_base64(pil_image: Image.Image) -> str:
+    from io import BytesIO
+    buffer = BytesIO()
+    pil_image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+def convert_transform_pdf_to_html(transform, scale=1.0):
+    # PDF transform (a,b,c,d,e,f) -> CSS matrix(a,b,c,d,e,f), with e,f scaled to px
+    if not transform or len(transform) < 6:
+        return "none"
+    a,b,c,d,e,f = transform[:6]
+    return f"matrix({a},{b},{c},{d},{e*scale}px,{f*scale}px)"
+
+def rect_intersects(r1, r2):
+    return not (r2.x1 <= r1.x0 or r2.x0 >= r1.x1 or r2.y1 <= r1.y0 or r2.y0 >= r1.y1)
+
+def get_clip_list_for_drawings(drawings):
+    clips = []
+    for d in drawings:
+        if d.get("type") == "clip":
+            clips.append(d)
+    return clips
+
+def find_active_clip_for_bbox(clips, bbox):
+    # bbox is [x0,y0,x1,y1]
+    if not clips or not bbox: return None
+    r = fitz.Rect(bbox)
+    # pick first clip whose scissor rect intersects the image rect
+    for c in clips:
+        sc = c.get("scissor")
+        if isinstance(sc, fitz.Rect) and rect_intersects(r, sc):
+            return {"scissor": sc}
+    return None
+
+# ============ HTML utility (returns text-only elements) ============
 def html_to_pages_from_string(html_str: str):
     soup = BeautifulSoup(html_str, "lxml")
     elements, next_id = [], 0
@@ -126,7 +161,7 @@ def html_to_pages_from_string(html_str: str):
         next_id += 1
     return [OrderedDict([("page", 1), ("elements", elements)])]
 
-# ---------- Text extraction ----------
+# ============ Text extraction (paragraph grouping) ============
 def _build_lines_from_spans(page_dict):
     lines = []
     for block in page_dict.get("blocks", []):
@@ -181,68 +216,138 @@ def _group_by_avg_gap_and_style(lines):
     if cur: groups.append(cur)
     return groups, avg_gap
 
-# ---------- Shapes (vector) ----------
-def _shapes_from_drawings(page):
-    out = []
-    drawings = page.get_drawings()
-    for idx, d in enumerate(drawings):
-        rect = d.get("rect", None)
-        stroke = _rgb_from_tuple(d.get("color"))
-        fill = _rgb_from_tuple(d.get("fill"))
-        lw = float(d.get("width") or d.get("linewidth") or 1.0)
-        dashes = d.get("dashes")
-        lineCap = d.get("lineCap")
-        lineJoin = d.get("lineJoin")
-        miter = d.get("miterLimit")
-        opacity = d.get("opacity")
-        blendmode = d.get("blendmode")
-        if rect is not None:
-            bbox = [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
-        else:
-            xmins, ymins, xmaxs, ymaxs = [], [], [], []
-            for it in d.get("items", []) or d.get("paths", []) or []:
-                try:
-                    for p in it:
-                        xmins.append(float(p[0])); ymins.append(float(p[1]))
-                        xmaxs.append(float(p[0])); ymaxs.append(float(p[1]))
-                except Exception:
-                    pass
-            if xmins:
-                bbox = [min(xmins), min(ymins), max(xmaxs), max(ymaxs)]
+# Normalize path points to local coords
+def _as_xy(val1, val2=None):
+    if val2 is not None:
+        # Two separate args (numbers or Points)
+        try:
+            if isinstance(val1, fitz.Point):
+                x = float(val1.x)
             else:
-                bbox = None
-        if not bbox: continue
-        out.append(OrderedDict([
+                x = float(val1)
+            if isinstance(val2, fitz.Point):
+                y = float(val2.y)
+            else:
+                y = float(val2)
+            return x, y
+        except Exception:
+            return None, None
+    # Single composite arg
+    v = val1
+    if isinstance(v, fitz.Point):
+        return float(v.x), float(v.y)
+    if isinstance(v, (list, tuple)) and len(v) >= 2:
+        try:
+            return float(v[0]), float(v[1])
+        except Exception:
+            return None, None
+    return None, None
+
+
+# ============ Vector drawings → raster images ============
+def _vector_drawings_to_images(page, scale=1.0):
+    images = []
+    drawings = page.get_drawings()
+    if not drawings:
+        return images
+    next_local_id = 0
+    for d in drawings:
+        rect = d.get("rect")
+        if rect is None:
+            continue
+        bbox = fitz.Rect(rect).round()
+        width_px = max(1, int(round(bbox.width * scale)))
+        height_px = max(1, int(round(bbox.height * scale)))
+
+        color = d.get("color")
+        fill_color = d.get("fill")
+        stroke_rgb = tuple(int(c*255) if c <= 1 else int(c) for c in list(color)[:3]) if color else (0,0,0)
+        fill_rgb = tuple(int(c*255) if c <= 1 else int(c) for c in list(fill_color)[:3]) if fill_color else None
+
+        # vector linewidth (not bbox.width!)
+        lw = 1
+        try:
+            line_width = d.get("width") or d.get("linewidth") or 1
+            lw = max(1, int(round(float(line_width) * scale)))
+        except Exception:
+            pass
+
+        # Canvas for this drawing
+        img = Image.new("RGBA", (width_px, height_px), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        
+
+        path = []
+        items = d.get("items") or d.get("paths") or []
+        for item in items:
+            if not item:
+                continue
+            op = item[0]
+            if op == "m":
+                # Flush previous path
+                if len(path) >= 2:
+                    draw.line(path, fill=stroke_rgb, width=lw)
+                    path = []
+                # Move to
+                x = y = None
+                if len(item) >= 3:
+                    x, y = _as_xy(item[1], item[2])
+                elif len(item) >= 2:
+                    x, y = _as_xy(item[1])
+                if x is not None and y is not None:
+                    path.append(((x - bbox.x0)*scale, (y - bbox.y0)*scale))
+            elif op == "l":
+                x = y = None
+                if len(item) >= 3:
+                    x, y = _as_xy(item[1], item[2])
+                elif len(item) >= 2:
+                    x, y = _as_xy(item[1])
+                if x is not None and y is not None:
+                    path.append(((x - bbox.x0)*scale, (y - bbox.y0)*scale))
+            elif op == "re":
+                r = None
+                if len(item) >= 2:
+                    rect_item = item[1]
+                    try:
+                        if isinstance(rect_item, fitz.Rect):
+                            r = rect_item
+                        elif isinstance(rect_item, (list, tuple)) and len(rect_item) >= 4:
+                            r = fitz.Rect(float(rect_item[0]), float(rect_item[1]), float(rect_item[2]), float(rect_item[3]))
+                        else:
+                            r = fitz.Rect(rect_item)
+                    except Exception:
+                        r = None
+                if r is not None:
+                    x0 = (r.x0 - bbox.x0)*scale; y0 = (r.y0 - bbox.y0)*scale
+                    x1 = (r.x1 - bbox.x0)*scale; y1 = (r.y1 - bbox.y0)*scale
+                    if fill_rgb is not None:
+                        draw.rectangle([x0, y0, x1, y1], fill=fill_rgb, outline=stroke_rgb, width=lw)
+                    else:
+                        draw.rectangle([x0, y0, x1, y1], outline=stroke_rgb, width=lw)
+            # Other ops (curves) ignored here
+
+        if len(path) >= 2:
+            draw.line(path, fill=stroke_rgb, width=lw)
+
+        b64 = _draw_img_to_base64(img)
+        images.append(OrderedDict([
             ("id", None),
-            ("type", "shape"),
-            ("page", page.number+1),
-            ("bbox", bbox),
-            ("strokeColor", stroke),
-            ("fillColor", fill),
-            ("lineWidth", lw),
-            ("strokeDash", dashes),
-            ("strokeCap", lineCap),
-            ("strokeJoin", lineJoin),
-            ("miterLimit", miter),
-            ("opacity", opacity),
-            ("blendMode", blendmode),
-            ("zIndex", idx),
+            ("type", "image"),
+            ("page", page.number + 1),
+            ("bbox", [float(bbox.x0), float(bbox.y0), float(bbox.x1), float(bbox.y1)]),
+            ("src", f"data:image/png;base64,{b64}"),
+            ("zIndex", d.get("sequence", next_local_id)),
             ("rotation", 0.0)
         ]))
-    return out
+        next_local_id += 1
+    return images
 
-
-# ---------- ISO sizes ----------
+# ============ ISO sizes ============
 _KNOWN_SIZES_MM = OrderedDict([
-    ("A0", (841, 1189)),
-    ("A1", (594, 841)),
-    ("A2", (420, 594)),
-    ("A3", (297, 420)),
-    ("A4", (210, 297)),
-    ("A5", (148, 210)),
-    ("A6", (105, 148)),
-    ("Letter", (216, 279)),
-    ("Legal", (216, 356)),
+    ("A0", (841, 1189)), ("A1", (594, 841)), ("A2", (420, 594)),
+    ("A3", (297, 420)), ("A4", (210, 297)), ("A5", (148, 210)), ("A6", (105, 148)),
+    ("Letter", (216, 279)), ("Legal", (216, 356)),
 ])
 
 def _classify_page_iso(width_pt: float, height_pt: float):
@@ -258,21 +363,72 @@ def _classify_page_iso(width_pt: float, height_pt: float):
         return best_name
     return "Unknown"
 
+# ============ Image extraction → JSON elements ============
+def _extract_images_as_elements(doc, page, scale=1.0, enable_clip=True, enable_transform=True):
+    elements = []
+    drawings_ext = page.get_drawings(extended=True)  # for clips
+    clips = get_clip_list_for_drawings(drawings_ext) if enable_clip else []
 
+    for img in page.get_images(full=True):
+        xref = img[0]; smask = img[1]
+        infos = page.get_image_info(xref)
+        if not infos:
+            continue
+        info = infos[0]
+        bbox = info.get("bbox")
+        if not bbox:
+            continue
 
-# ---------- Font extraction (removed) ----------
+        # Extract image bytes (fallback to Pixmap if needed)
+        src = None
+        try:
+            image_dict = doc.extract_image(xref)
+            raw_bytes = image_dict.get("image")
+            if raw_bytes:
+                src = f"data:image/{image_dict.get('ext','png')};base64," + base64.b64encode(raw_bytes).decode("ascii")
+        except Exception:
+            try:
+                pix = fitz.Pixmap(doc, xref)
+                src = "data:image/png;base64," + base64.b64encode(pix.tobytes("png")).decode("ascii")
+            except Exception:
+                src = None
 
-# ---------- Main extraction ----------
-def pdf_to_pages(pdf_path, bg_enable=False, bg_dpi=150, upload_id_for_fonts=None):
+        # Optional transform and clip-path
+        transform = convert_transform_pdf_to_html(info.get("transform"), scale) if enable_transform else "none"
+        active_clip = find_active_clip_for_bbox(clips, bbox) if enable_clip else None
+        clip_path = None
+        if active_clip:
+            sc = active_clip["scissor"]
+            # Convert to polygon relative to image bbox origin
+            left, top = bbox[0], bbox[1]
+            x0 = (sc.x0 - left)*scale; y0 = (sc.y0 - top)*scale
+            x1 = (sc.x1 - left)*scale; y1 = (sc.y1 - top)*scale
+            clip_path = f"polygon({x0}px {y0}px, {x1}px {y0}px, {x1}px {y1}px, {x0}px {y1}px)"
+
+        elements.append(OrderedDict([
+            ("id", f"i:{page.number+1}:{len(elements)}"),
+            ("type", "image"),
+            ("page", page.number+1),
+            ("bbox", [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]),
+            ("src", src),
+            ("transform", transform),
+            ("clipPath", clip_path),
+            ("rotation", 0.0)
+        ]))
+    return elements
+
+# ============ Main extraction ============
+def pdf_to_pages(pdf_path, scale=1.0):
     doc = fitz.open(pdf_path)
-    pages = []
-    for page_idx, page in enumerate(doc, start=1):
-        page_dict = page.get_text("dict")
+    pages_out = []
 
-        lines = _build_lines_from_spans(page_dict)
-        groups, avg_gap = _group_by_avg_gap_and_style(lines)
+    for page_idx, page in enumerate(doc, start=1):
+        pd = page.get_text("dict")
+        lines = _build_lines_from_spans(pd)
+        groups, _ = _group_by_avg_gap_and_style(lines)
 
         elements, next_id = [], 0
+        # Text elements (plain text content)
         for glines in groups:
             left = min(l["left"] for l in glines); top = min(l["top"] for l in glines)
             right = max(l["right"] for l in glines); bottom = max(l["bottom"] for l in glines)
@@ -284,12 +440,12 @@ def pdf_to_pages(pdf_path, bg_enable=False, bg_dpi=150, upload_id_for_fonts=None
             line_height = float(_median([l["height"] for l in glines], dom_size * 1.2))
             angles = [float(l.get("angle", 0.0)) for l in glines]
             rotation = float(_median(angles, 0.0))
-            # content as plain text with newline separators
             content_text = "\n".join(l["text"] for l in glines)
+
             elements.append(OrderedDict([
                 ("id", f"t:{page_idx}:{next_id}"),
                 ("type", "text"),
-                ("content", content_text),  # plain text
+                ("content", content_text),
                 ("font", dom_font),
                 ("fontSize", dom_size),
                 ("lineHeight", line_height),
@@ -303,37 +459,21 @@ def pdf_to_pages(pdf_path, bg_enable=False, bg_dpi=150, upload_id_for_fonts=None
             ]))
             next_id += 1
 
-        for z_idx, img in enumerate(page.get_images(full=True)):
-            xref = int(img[0]); smask = img[1]
-            width = int(img[2]) if len(img) > 2 else None
-            height = int(img[3]) if len(img) > 3 else None
-            bpc = int(img[4]) if len(img) > 4 else None
-            cs = img[5] if len(img) > 5 else None
-            rect = page.get_image_bbox(img)
-            bbox = [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
-            has_alpha = (smask not in (0, -1, None))
-            elements.append(OrderedDict([
-                ("id", f"i:{page_idx}:{next_id}"), ("type", "image"), ("page", page_idx),
-                ("bbox", bbox), ("xref", xref),
-                ("naturalSize", OrderedDict([("width", width), ("height", height)])),
-                ("bitsPerComponent", bpc), ("colorSpace", cs),
-                ("hasAlpha", bool(has_alpha)), ("zIndex", z_idx),
-                ("rotation", 0.0)
-            ]))
-            next_id += 1
+        # Bitmap images
+        elements.extend(_extract_images_as_elements(doc, page, scale=scale))
 
-        shapes = _shapes_from_drawings(page)
-        for s in shapes:
-            s["id"] = f"v:{page_idx}:{next_id}"
-            elements.append(s); next_id += 1
-
+        # Vector drawings → raster images
+        vimgs = _vector_drawings_to_images(page, scale=scale)
+        for vi in vimgs:
+            vi["id"] = f"i:{page_idx}:{next_id}"
+            elements.append(vi); next_id += 1
 
         width_pt = float(page.rect.width)
         height_pt = float(page.rect.height)
         orientation = "portrait" if height_pt >= width_pt else "landscape"
         iso = _classify_page_iso(width_pt, height_pt)
 
-        pages.append(OrderedDict([
+        pages_out.append(OrderedDict([
             ("page", page_idx),
             ("rotation", int(page.rotation or 0)),
             ("size", OrderedDict([
@@ -347,16 +487,9 @@ def pdf_to_pages(pdf_path, bg_enable=False, bg_dpi=150, upload_id_for_fonts=None
         ]))
 
     doc.close()
+    return pages_out
 
-    # Fonts extraction removed
-    return pages, []
-
-# ---------- Routes ----------
-@app.get('/health')
-def health():
-    return jsonify({"status": "ok", "service": "python"})
-
-# Fonts serving route removed (mutool usage discarded)
+# ============ Routes ============
 
 @app.post('/convert/pdf-to-html')
 def convert_pdf_to_html():
@@ -365,11 +498,13 @@ def convert_pdf_to_html():
     f = request.files['file']
     filename = secure_filename(f.filename or 'upload.pdf')
     upload_id = request.form.get('uploadId') or 'unknown'
+    # You can expose a scale param if you want px scaling; default 1.0 here
+    scale = float(request.form.get('scale', request.args.get('scale', '1.0')))
 
     file_path = os.path.join(UPLOAD_DIR, filename)
     f.save(file_path)
     try:
-        pages, fonts = pdf_to_pages(file_path)
+        pages = pdf_to_pages(file_path, scale=scale)
         return jsonify(OrderedDict([
             ("filename", filename),
             ("uploadId", upload_id),
@@ -380,13 +515,6 @@ def convert_pdf_to_html():
     finally:
         try: os.unlink(file_path)
         except Exception: pass
-
-@app.post('/generate/html-to-pdf')
-def generate_html_to_pdf():
-    return jsonify({
-        "error": "PDF generation moved to PHP layer. Use PHP MPDF for PDF generation.",
-        "suggestion": "Use the PHP controller's MPDF integration instead"
-    }), 501
 
 @app.post('/convert/html-to-json')
 def convert_html_to_json():
