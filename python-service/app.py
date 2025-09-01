@@ -59,15 +59,6 @@ def _infer_italic_from_font(font_name: str) -> bool:
     f = font_name.lower()
     return ("italic" in f) or ("oblique" in f)
 
-def _css_flags(style: dict):
-    fw = (style.get("font-weight") or "").strip().lower()
-    fs = (style.get("font-style") or "").strip().lower()
-    td = (style.get("text-decoration") or "").strip().lower()
-    bold = fw in ("bold", "bolder", "600", "700", "800", "900")
-    italic = fs in ("italic", "oblique")
-    underline = "underline" in td
-    strike = ("line-through" in td) or ("strikethrough" in td)
-    return bold, italic, underline, strike
 
 def _mean(values, default=0.0):
     try: return statistics.mean(values) if values else default
@@ -89,12 +80,6 @@ def _style_equal(a, b, size_tol=0.5):
     if bool(a.get("italic", False)) != bool(b.get("italic", False)): return False
     return True
 
-def _rgb_from_tuple(t):
-    if t is None: return None
-    vals = list(t)
-    if not vals: return None
-    if max(vals) <= 1.0: vals = [int(round(v*255)) for v in vals]
-    return [int(v) for v in vals[:3]]
 
 def _draw_img_to_base64(pil_image: Image.Image) -> str:
     from io import BytesIO
@@ -130,36 +115,6 @@ def find_active_clip_for_bbox(clips, bbox):
             return {"scissor": sc}
     return None
 
-# ============ HTML utility (returns text-only elements) ============
-def html_to_pages_from_string(html_str: str):
-    soup = BeautifulSoup(html_str, "lxml")
-    elements, next_id = [], 0
-    for span in soup.find_all("span"):
-        style = parse_style(span.get("style", ""))
-        def px(v, d=0.0):
-            try: return float(re.sub("px", "", v))
-            except Exception: return d
-        x, y = px(style.get("left", "0")), px(style.get("top", "0"))
-        w, h = px(style.get("width", "0")), px(style.get("height", "0"))
-        size = px(style.get("font-size", "12"), 12.0)
-        font = (style.get("font-family", "") or "").replace('"', "")
-        color_rgb = _css_color_to_rgb(style.get("color"))
-        b,i,u,s = _css_flags(style)
-        content_text = (span.get_text() or "").strip()
-        if not content_text: continue
-        bbox = [x, y, x + w, y + h] if (w and h) else [x, y, x, y]
-        line_height = float(h) if h > 0 else float(size) * 1.2
-        elements.append(OrderedDict([
-            ("id", f"t:1:{next_id}"), ("type", "text"),
-            ("content", content_text),  # plain text
-            ("font", font), ("fontSize", float(size)), ("lineHeight", float(line_height)),
-            ("rotation", 0.0),
-            ("bbox", [float(b) for b in bbox]),
-            ("color", color_rgb), ("bold", bool(b)), ("italic", bool(i)),
-            ("underline", bool(u)), ("strike", bool(s))
-        ]))
-        next_id += 1
-    return [OrderedDict([("page", 1), ("elements", elements)])]
 
 # ============ Text extraction (paragraph grouping) ============
 def _build_lines_from_spans(page_dict):
@@ -680,15 +635,6 @@ def convert_pdf_to_html():
         try: os.unlink(file_path)
         except Exception: pass
 
-@app.post('/convert/html-to-json')
-def convert_html_to_json():
-    payload = request.get_json(silent=True) or {}
-    html_str = payload.get('html')
-    if not html_str and 'html' in request.files:
-        html_str = request.files['html'].read().decode('utf-8', errors='ignore')
-    if not html_str:
-        return jsonify({"error": "missing 'html' content"}), 400
-    return jsonify({"pages": html_to_pages_from_string(html_str)})
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', '5001'))
